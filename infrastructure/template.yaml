@@ -1,0 +1,263 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  CrediFacil IDP - Infraestrutura Completa de Pipelines e Lambdas (Hackathon 2026)
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+    Description: Ambiente de implantacao (dev ou prod)
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architecture: arm64 # RNF-05: Arquitetura Graviton2 para máxima eficiência e menor custo
+    Timeout: 30
+    MemorySize: 256
+    Tracing: Active # RO-04: Ativa o rastreio distribuído do AWS X-Ray automaticamente
+    Environment:
+      Variables:
+        ENV: !Ref Environment
+        DYNAMODB_TABLE: !Ref CrediFacilDynamoTable
+        BUCKET_ENTRADA: !Ref BucketEntrada
+        BUCKET_SAIDA: !Ref BucketSaida
+        SNS_COMPLETION_TOPIC_ARN: !Ref SnsTopicoConclusao
+        SNS_ERROR_TOPIC_ARN: !Ref SnsTopicoErros
+
+Resources:
+  # ==========================================================================
+  # 🔑 CAMADA DE SEGURANÇA E ARMAZENAMENTO BASE
+  # ==========================================================================
+  CrediFacilKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "Chave KMS para criptografia em repouso - CrediFacil (${Environment})"
+      Enabled: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Permitir uso total da chave pela conta raiz
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+
+  BucketEntrada:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "credifacil-docs-entrada-${Environment}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyId: !Ref CrediFacilKmsKey
+
+  BucketSaida:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "credifacil-docs-saida-${Environment}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyId: !Ref CrediFacilKmsKey
+
+  CrediFacilDynamoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "credifacil-pacotes-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref CrediFacilKmsKey
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+
+  # ==========================================================================
+  # 📢 CAMADA DE NOTIFICAÇÕES (Amazon SNS)
+  # ==========================================================================
+  SnsTopicoConclusao:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "credifacil-conclusao-${Environment}"
+      KmsMasterKeyId: !Ref CrediFacilKmsKey
+
+  SnsTopicoErros:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "credifacil-erros-${Environment}"
+      KmsMasterKeyId: !Ref CrediFacilKmsKey
+
+  # ==========================================================================
+  # 🌐 CAMADA DE ROTEAMENTO (Amazon API Gateway REST)
+  # ==========================================================================
+  CrediFacilRestApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+      Cors: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !Sub "arn:aws:cognito-idp:us-east-1:${AWS::AccountId}:userpool/us-east-1_fakePoolId" # Substituído pelo ARN real no deploy
+            IdentitySource: method.request.header.Authorization
+
+  # ==========================================================================
+  # 🚀 DECLARAÇÃO DAS FUNÇÕES LAMBDA (Core & API)
+  # ==========================================================================
+
+  # 1. Lambda: Pre-Signed URL (Emissão de Links de Ingestão)
+  PreSignedUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/lambdas/pre_signed_url/
+      Handler: handler.handler
+      Policies:
+        - S3CrudPolicy: # Permissão restrita para interagir com o Bucket de Entrada
+            BucketName: !Sub "credifacil-docs-entrada-${Environment}"
+      Events:
+        ApiGatewayTrigger:
+          Type: Api
+          Properties:
+            Path: /v1/packages/upload-urls
+            Method: post
+            RestApiId: !Ref CrediFacilRestApi
+
+  # 2. Lambda: Pipeline Trigger (Validação e Ignição da Esteira)
+  PipelineTriggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/lambdas/pipeline_trigger/
+      Handler: handler.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Sub "credifacil-pacotes-${Environment}"
+        - Statement:
+            - Sid: AllowStepFunctionsExecution
+              Effect: Allow
+              Action: "states:StartExecution"
+              Resource: "*" # Permitirá invocar a State Machine do Step Functions
+      Events:
+        ApiGatewayTrigger:
+          Type: Api
+          Properties:
+            Path: /v1/packages/{packageId}/process
+            Method: post
+            RestApiId: !Ref CrediFacilRestApi
+
+  # 3. Lambda: BDA Invoker (Disparo assíncrono do motor de IA)
+  BdaInvokerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/lambdas/bda_invoker/
+      Handler: handler.handler
+      MemorySize: 512
+      Policies:
+        - Statement:
+            - Sid: AllowBedrockAutomationAsync
+              Effect: Allow
+              Action: 
+                - "bedrock:InvokeDataAutomationAsync"
+                - "sts:GetCallerIdentity"
+              Resource: "*"
+
+  # 4. Lambda: BDA Status Poller (Monitor do estado da IA)
+  BdaStatusPollerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/lambdas/bda_status_poller/
+      Handler: handler.handler
+      Policies:
+        - Statement:
+            - Sid: AllowGetAutomationStatus
+              Effect: Allow
+              Action: "bedrock:GetDataAutomationStatus"
+              Resource: "*"
+
+  # 5. Lambda: Confidence Checker (Roteador de Limiar)
+  ConfidenceCheckerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/lambdas/confidence_checker/
+      Handler: handler.handler
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Sub "credifacil-docs-saida-${Environment}"
+
+  # 6. Lambda: Nova Structurer (LLM Tool Calling)
+  NovaStructurerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/lambdas/nova_structurer/
+      Handler: handler.handler
+      MemorySize: 1024 # Maior footprint de memória necessário para processar chamadas complexas de LLM
+      Timeout: 120    # Timeout estendido para mitigar variações de latência de inferência de IA
+      Policies:
+        - Statement:
+            - Sid: AllowBedrockNovaInvoke
+              Effect: Allow
+              Action: "bedrock:InvokeModel"
+              Resource: "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0" # Escopo restrito ao modelo do Case
+
+  # 7. Lambda: Result Writer (Persistência Final)
+  ResultWriterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/lambdas/result_writer/
+      Handler: handler.handler
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Sub "credifacil-docs-saida-${Environment}"
+        - DynamoDBCrudPolicy:
+            TableName: !Sub "credifacil-pacotes-${Environment}"
+        - KMSSrudPolicy: # Permissão para usar a chave criptográfica nos salvamentos
+            KmsKeyArn: !GetAtt CrediFacilKmsKey.Arn
+
+  # 8. Lambda: Query Handler (Leitura síncrona REST)
+  QueryHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/lambdas/query_handler/
+      Handler: handler.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Sub "credifacil-pacotes-${Environment}"
+        - S3ReadPolicy:
+            BucketName: !Sub "credifacil-docs-saida-${Environment}"
+      Events:
+        ApiGatewayTrigger:
+          Type: Api
+          Properties:
+            Path: /v1/packages/{packageId}
+            Method: get
+            RestApiId: !Ref CrediFacilRestApi
+
+  # 9. Lambda: Notification (Mensageria e Alertas)
+  NotificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/lambdas/notification/
+      Handler: handler.handler
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicArn: !Ref SnsTopicoConclusao
+        - SNSPublishMessagePolicy:
+            TopicArn: !Ref SnsTopicoErros
+
+Outputs:
+  ApiEndpoint:
+    Description: URL Base da API REST no API Gateway para consumo do Frontend
+    Value: !Sub "https://${CrediFacilRestApi}.execute-api.us-east-1.amazonaws.com/${Environment}/"

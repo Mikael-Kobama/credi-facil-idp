@@ -1,0 +1,35 @@
+# === Python e Ambientes Virtuais ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+.venv/
+venv/
+ENV/
+interface/
+
+# === Framework de Testes (Pytest) ===
+.pytest_cache/
+.coverage
+htmlcov/
+
+# === Infraestrutura como Código (AWS SAM) ===
+.aws-sam/
+samconfig.toml
+# Opcional: Se vocês guardarem secrets locais nos parâmetros
+parameters/*.json
+
+# === IDEs e Editores (VS Code / JetBrains) ===
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# === Sistema Operacional ===
+.DS_Store
+Thumbs.db
